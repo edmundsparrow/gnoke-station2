@@ -1,205 +1,176 @@
-/* =============================================================
-   gnoke-client.js — v2.0.0
-   Gnoke Firmware — Tab Process Stub
-   Edmund Sparrow © 2026 — MIT
-
-   WHAT THIS IS:
-   ─────────────────────────────────────────────────────────────
-   Runs inside each tab. Connects the tab to the firmware bus
-   (gnoke-worker.js), registers it as a named process with a
-   PID, and handles resurrection — re-registering automatically
-   when the tab wakes from suspension.
-
-   WHAT IT DOES:
-   ─────────────────────────────────────────────────────────────
-   1. Generates or restores a stable PID for this tab.
-      PIDs survive tab reload via sessionStorage.
-      PIDs are unique per tab instance.
-
-   2. Registers with the bus on connect.
-      Re-registers silently on resurrection (visibilitychange).
-
-   3. Sends a heartbeat every 30s so the bus knows this
-      process is still alive.
-
-   4. Routes incoming bus messages to registered listeners.
-
-   5. Exposes a clean API for app code — send, broadcast,
-      listen, list processes.
-
-   USAGE:
-   ─────────────────────────────────────────────────────────────
-     // Boot (call once, before anything else)
-     await GnokeClient.boot({ name: 'dashboard', meta: { role: 'operator' } });
-
-     // Send to a specific process
-     GnokeClient.send('pid-of-other-tab', 'ORDER_UPDATED', { id: 123 });
-
-     // Broadcast to all processes
-     GnokeClient.broadcast('USER_SIGNED_OUT', {});
-
-     // Listen for messages from the bus
-     GnokeClient.on('ORDER_UPDATED', (data, from) => { ... });
-
-     // Listen for process lifecycle events
-     GnokeClient.onProcessBorn((pid, meta) => { ... });
-     GnokeClient.onProcessDied((pid) => { ... });
-     GnokeClient.onRegistry((processes) => { ... });
-
-     // Get current registry snapshot
-     const procs = await GnokeClient.list();
-
-     // Current PID of this tab
-     GnokeClient.pid
-   ============================================================= */
 
 'use strict';
-
 const GnokeClient = (() => {
-
-  const WORKER_PATH = '/gnoke-worker.js';
-  const HEARTBEAT_MS = 30_000;
-
+  const WORKER_PATH = '/firmware/gnoke-worker.js';
+  const HEARTBEAT_MS = 20_000;
   let _port       = null;
   let _pid        = null;
   let _booted     = false;
   let _bootP      = null;
   let _hbTimer    = null;
-
   let _seq = 0;
-  const _pending  = new Map();   // _id → { resolve, reject }
-  const _handlers = new Map();   // event → Set<fn>
+  const _pending  = new Map();
+  const _handlers = new Map();
   const _born     = new Set();
   const _died     = new Set();
   const _reg      = new Set();
+  /* ── Firmware IDB — config store ────────────────────────────────────
+     Replaces localStorage for PID persistence. GnokeFirmware/config is
+     the same DB the SharedWorker uses for topology checkpoints. PIDs
+     stored here survive browser restarts without using localStorage.
+  ──────────────────────────────────────────────────────────────────── */
+  const _fwDB = (() => {
+    let _db = null;
+    function _open() {
+      if (_db) return Promise.resolve(_db);
+      return new Promise((res, rej) => {
+        const req = indexedDB.open('GnokeFirmware', 2);
+        req.onupgradeneeded = e => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains('kernel')) db.createObjectStore('kernel');
+          if (!db.objectStoreNames.contains('config')) db.createObjectStore('config');
+        };
+        req.onsuccess = e => { _db = e.target.result; res(_db); };
+        req.onerror   = e => rej(e.target.error);
+      });
+    }
+    return {
+      async get(key) {
+        const db = await _open();
+        return new Promise((res, rej) => {
+          const r = db.transaction('config','readonly').objectStore('config').get(key);
+          r.onsuccess = () => res(r.result ?? null);
+          r.onerror   = () => rej(r.error);
+        });
+      },
+      async set(key, val) {
+        const db = await _open();
+        return new Promise((res, rej) => {
+          const r = db.transaction('config','readwrite').objectStore('config').put(val, key);
+          r.onsuccess = () => res();
+          r.onerror   = () => rej(r.error);
+        });
+      },
+      async remove(key) {
+        const db = await _open();
+        return new Promise((res, rej) => {
+          const r = db.transaction('config','readwrite').objectStore('config').delete(key);
+          r.onsuccess = () => res();
+          r.onerror   = () => rej(r.error);
+        });
+      },
+    };
+  })();
 
-  /* ── PID management ────────────────────────────────────────
-     Stable per tab-session. Survives reload. Dies with tab.  */
-  function _resolvePID(name) {
-    const key = 'gnoke:pid';
-    let pid = sessionStorage.getItem(key);
+  async function _resolvePID(name) {
+    const key = `pid:${name}`;
+    let pid = await _fwDB.get(key);
     if (!pid) {
       const slug = (name || 'proc').toLowerCase().replace(/\W+/g, '-');
       pid = `${slug}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
-      sessionStorage.setItem(key, pid);
+      await _fwDB.set(key, pid);
     }
     return pid;
   }
-
-  /* ── boot() ────────────────────────────────────────────────
-     Call once per tab. Idempotent.                           */
+  let _meta        = {};
+  let _sessionToken = null;   /* set by SESSION_TOKEN event from worker on connect */
   function boot({ name = 'app', meta = {} } = {}) {
     if (_bootP) return _bootP;
-
+    _meta = { name, ...meta };
     _bootP = (async () => {
       if (!('SharedWorker' in window)) {
         console.warn('[gnoke-client] SharedWorker not supported — firmware bus unavailable.');
         _booted = true;
         return;
       }
-
-      _pid = _resolvePID(name);
-
+      _pid = await _resolvePID(name);
       const worker = new SharedWorker(WORKER_PATH);
       _port = worker.port;
       _port.onmessage = _onMessage;
       _port.start();
-
-      await _send({ cmd: 'REGISTER', pid: _pid, meta: { name, ...meta } });
-
+      /* Wait for the worker to push its session token before registering.
+         This ensures we never register with a stale token from a previous boot. */
+      _sessionToken = await new Promise(resolve => {
+        const handler = ev => {
+          if (ev.data?.event === 'SESSION_TOKEN') {
+            _port.removeEventListener('message', handler);
+            resolve(ev.data.token);
+          }
+        };
+        _port.addEventListener('message', handler);
+      });
+      const regResult = await _send({ cmd: 'REGISTER', pid: _pid, meta: _meta, token: _sessionToken });
+      if (regResult?.error === 'SESSION_MISMATCH') {
+        /* Stale PID from a previous worker session — clear it and generate a fresh one */
+        await _fwDB.remove(`pid:${_meta.name || 'app'}`);
+        _pid = await _resolvePID(name);
+        await _send({ cmd: 'REGISTER', pid: _pid, meta: _meta, token: _sessionToken });
+      }
       _startHeartbeat();
       _watchVisibility();
-
       _booted = true;
     })();
-
     return _bootP;
   }
-
-  /* ── Heartbeat ──────────────────────────────────────────── */
   function _startHeartbeat() {
     clearInterval(_hbTimer);
     _hbTimer = setInterval(() => {
       _send({ cmd: 'PING', pid: _pid }).catch(() => {});
     }, HEARTBEAT_MS);
   }
-
-  /* ── Resurrection ───────────────────────────────────────────
-     When tab comes back from suspension, re-register with bus.
-     The bus may have reaped this PID during silence.          */
   function _watchVisibility() {
     document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState !== 'visible') return;
       if (!_pid || !_port) return;
-      // Re-register — bus drops duplicates gracefully
-      await _send({ cmd: 'REGISTER', pid: _pid, meta: {} }).catch(() => {});
+      if (document.visibilityState === 'hidden') {
+        /* Stamp a fresh ping before the browser throttles our interval */
+        _send({ cmd: 'PING', pid: _pid }).catch(() => {});
+        return;
+      }
+      await _send({ cmd: 'REGISTER', pid: _pid, meta: _meta }).catch(() => {});
       _startHeartbeat();
     });
   }
-
-  /* ── Public API ─────────────────────────────────────────── */
-
   async function send(to, event, data) {
     _assert();
     return _send({ cmd: 'SEND', from: _pid, to, event, data });
   }
-
   async function broadcast(event, data) {
     _assert();
     return _send({ cmd: 'BROADCAST', from: _pid, event, data });
   }
-
   async function list() {
     _assert();
     const result = await _send({ cmd: 'LIST' });
     return result.processes;
   }
-
-  /* ── claimCapability() ──────────────────────────────────────
-     Requests exclusive ownership of a named capability from
-     the kernel. First-port-wins. Authority is bound to this
-     tab's MessagePort, not its PID string.                   */
+  async function listAll() {
+    _assert();
+    const result = await _send({ cmd: 'LIST' });
+    return { processes: result.processes || {}, ghosts: result.ghosts || {} };
+  }
   async function claimCapability(capability) {
     _assert();
     return _send({ cmd: 'CLAIM_CAPABILITY', capability });
   }
-
-  /* ── releaseCapability() ────────────────────────────────────
-     Releases ownership of a named capability.               */
   async function releaseCapability(capability) {
     _assert();
     return _send({ cmd: 'RELEASE_CAPABILITY', capability });
   }
-
-  /* ── _sendKernel() ──────────────────────────────────────────
-     Internal path used by GnokeSyscall to send kernel-routed
-     commands (SYSCALL) without a named recipient PID.
-     Not part of the public app API.                          */
   function _sendKernel(msg) {
     _assert();
     return _send(msg);
   }
-
-  /* ── Event listeners ────────────────────────────────────── */
-
-  // Listen for messages sent to this tab
   function on(event, fn) {
     if (!_handlers.has(event)) _handlers.set(event, new Set());
     _handlers.get(event).add(fn);
     return () => _handlers.get(event)?.delete(fn);
   }
-
   function onProcessBorn(fn) { _born.add(fn); return () => _born.delete(fn); }
   function onProcessDied(fn) { _died.add(fn); return () => _died.delete(fn); }
   function onRegistry(fn)    { _reg.add(fn);  return () => _reg.delete(fn);  }
-
-  /* ── Internal message handling ──────────────────────────── */
-
   function _onMessage(evt) {
     const msg = evt.data;
     if (!msg) return;
-
-    // Response to a sent command
     if (msg._id) {
       const p = _pending.get(msg._id);
       if (!p) return;
@@ -207,8 +178,6 @@ const GnokeClient = (() => {
       msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error));
       return;
     }
-
-    // Broadcast from bus
     switch (msg.event) {
       case 'MESSAGE': {
         const fns = _handlers.get(msg.type);
@@ -224,9 +193,14 @@ const GnokeClient = (() => {
       case 'REGISTRY':
         _reg.forEach(fn => { try { fn(msg.processes); } catch {} });
         break;
+      case 'PEER_JOINED':
+        /* A new process joined — re-announce ourselves so it sees us in the registry */
+        if (_pid && _port && _meta) {
+          _send({ cmd: 'REGISTER', pid: _pid, meta: _meta }).catch(() => {});
+        }
+        break;
     }
   }
-
   function _send(msg) {
     return new Promise((resolve, reject) => {
       const _id = `gc_${Date.now().toString(36)}_${++_seq}`;
@@ -239,17 +213,15 @@ const GnokeClient = (() => {
       }
     });
   }
-
   function _assert() {
     if (!_booted) throw new Error('[gnoke-client] Call boot() first.');
   }
-
-  /* ── Export ─────────────────────────────────────────────── */
   return Object.freeze({
     boot,
     send,
     broadcast,
     list,
+    listAll,
     claimCapability,
     releaseCapability,
     _sendKernel,
@@ -260,8 +232,5 @@ const GnokeClient = (() => {
     get pid() { return _pid; },
     get ready() { return _booted; },
   });
-
 })();
-
 if (typeof window !== 'undefined') window.GnokeClient = GnokeClient;
-
